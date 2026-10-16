@@ -168,7 +168,6 @@ workflows:
       - build-image:
           name: build-qa
           image_tag: qa
-          context: docker-hub
           requires:
             - secret-scan
           filters:
@@ -178,7 +177,6 @@ workflows:
       - build-image:
           name: build-stage
           image_tag: stage
-          context: docker-hub
           requires:
             - secret-scan
           filters:
@@ -188,7 +186,6 @@ workflows:
       - build-image:
           name: build-prod
           image_tag: prod
-          context: docker-hub
           requires:
             - secret-scan
           filters:
