@@ -1,0 +1,193 @@
+
+version: 2.1
+
+executors:
+  node:
+    docker:
+      - image: cimg/node:20.18
+
+jobs:
+  lint:
+    executor: node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - 'npm-{{ checksum "package.json" }}'
+            - npm-
+      - run:
+          name: Install dependencies
+          command: npm install
+      - save_cache:
+          key: 'npm-{{ checksum "package.json" }}'
+          paths:
+            - node_modules
+      - run:
+          name: Lint code
+          command: npm run lint
+
+  unit:
+    executor: node
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - 'npm-{{ checksum "package.json" }}'
+            - npm-
+      - run:
+          name: Install dependencies
+          command: npm install
+      - run:
+          name: Run unit tests
+          command: npm test
+
+  integration:
+    docker:
+      - image: cimg/node:20.18
+        environment:
+          PORT: "18080"
+          DATABASE_URL: postgres://habit:habit@localhost:5432/habits
+          REDIS_URL: redis://localhost:6379
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: habit
+          PGPASSWORD: habit
+          PGDATABASE: habits
+      - image: postgres:16.4-alpine
+        environment:
+          POSTGRES_USER: habit
+          POSTGRES_PASSWORD: habit
+          POSTGRES_DB: habits
+      - image: redis:7.4-alpine
+
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - 'npm-{{ checksum "package.json" }}'
+            - npm-
+      - run:
+          name: Install dependencies
+          command: npm install
+      - run:
+          name: Wait for PostgreSQL and Redis
+          command: |
+            for i in $(seq 1 60); do
+              if (echo > /dev/tcp/localhost/5432) 2>/dev/null &&
+                 (echo > /dev/tcp/localhost/6379) 2>/dev/null; then
+                echo "PostgreSQL and Redis are accepting connections"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Services did not become ready"
+            exit 1
+      - run:
+          name: Apply database migrations
+          command: npm run migrate
+      - run:
+          name: Run integration tests
+          command: npm run test:integration
+
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install Gitleaks
+          command: |
+            curl -fL \
+              https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+              -o /tmp/gitleaks.tar.gz
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - run:
+          name: Scan repository for secrets
+          command: /tmp/gitleaks detect --source . --verbose --redact
+
+  build-image:
+    parameters:
+      image_tag:
+        type: string
+
+    docker:
+      - image: cimg/base:stable
+
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: |
+            set -eu
+            IMAGE="$DOCKERHUB_USER/habit-tracker"
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+
+            docker build \
+              -t "$IMAGE:<< parameters.image_tag >>" \
+              -t "$IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}" \
+              .
+
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              docker tag "$IMAGE:<< parameters.image_tag >>" "$IMAGE:1.0"
+            fi
+      - run:
+          name: Log in and push Docker image
+          command: |
+            set -eu
+            IMAGE="$DOCKERHUB_USER/habit-tracker"
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+
+            echo "$DOCKERHUB_TOKEN" |
+              docker login -u "$DOCKERHUB_USER" --password-stdin
+
+            docker push "$IMAGE:<< parameters.image_tag >>"
+            docker push "$IMAGE:${CIRCLE_BRANCH}-${SHORT_SHA}"
+
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              docker push "$IMAGE:1.0"
+            fi
+
+workflows:
+  ci:
+    jobs:
+      - lint
+
+      - unit:
+          requires:
+            - lint
+
+      - integration:
+          requires:
+            - unit
+
+      - secret-scan:
+          requires:
+            - integration
+
+      - build-image:
+          name: build-qa
+          image_tag: qa
+          requires:
+            - secret-scan
+          filters:
+            branches:
+              only: main
+
+      - build-image:
+          name: build-stage
+          image_tag: stage
+          requires:
+            - secret-scan
+          filters:
+            branches:
+              only: staging
+
+      - build-image:
+          name: build-prod
+          image_tag: prod
+          requires:
+            - secret-scan
+          filters:
+            branches:
+              only: prod

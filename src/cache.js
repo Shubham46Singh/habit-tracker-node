@@ -1,30 +1,61 @@
+/**
+ * Redis cache for streak figures. Cache failures never break the API:
+ * reads return null and writes are skipped, so Postgres stays the source of truth.
+ */
 const { createClient } = require('redis');
 
 let client = null;
+let connecting = null;
 
 async function getClient() {
-  if (client) return client;
-  client = createClient({ url: process.env.REDIS_URL });
-  client.on('error', (e) => console.error('redis error', e.message));
-  await client.connect();
-  return client;
+  if (client && client.isOpen) return client;
+  if (!connecting) {
+    const c = createClient({
+      url: process.env.REDIS_URL,
+      // fail fast instead of retrying forever, so /health can report redis: false
+      socket: { reconnectStrategy: false },
+    });
+    c.on('error', () => {});
+    connecting = c.connect()
+      .then(() => { client = c; return c; })
+      .finally(() => { connecting = null; });
+  }
+  return connecting;
 }
 
-/** Cache a habit's computed streak. Expires at the end of the day. */
-async function setStreak(habitId, value, ttlSeconds) {
-  const c = await getClient();
-  await c.set(`streak:${habitId}`, JSON.stringify(value), { EX: ttlSeconds });
-}
+const key = (habitId) => `streak:${habitId}`;
 
 async function getStreak(habitId) {
-  const c = await getClient();
-  const raw = await c.get(`streak:${habitId}`);
-  return raw ? JSON.parse(raw) : null;
+  try {
+    const c = await getClient();
+    const raw = await c.get(key(habitId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setStreak(habitId, stats, ttlSeconds) {
+  try {
+    const c = await getClient();
+    await c.set(key(habitId), JSON.stringify(stats), { EX: ttlSeconds });
+  } catch {
+    /* cache is best-effort */
+  }
 }
 
 async function invalidate(habitId) {
-  const c = await getClient();
-  await c.del(`streak:${habitId}`);
+  try {
+    const c = await getClient();
+    await c.del(key(habitId));
+  } catch {
+    /* cache is best-effort */
+  }
 }
 
-module.exports = { getClient, setStreak, getStreak, invalidate };
+async function close() {
+  if (client && client.isOpen) await client.quit();
+  client = null;
+}
+
+module.exports = { getClient, getStreak, setStreak, invalidate, close };
