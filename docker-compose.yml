@@ -1,0 +1,58 @@
+# One command: docker compose up --build
+# Inside compose the hosts are the SERVICE NAMES (postgres, redis), not localhost.
+
+x-app: &app
+  build: .
+  image: ${DOCKERHUB_USER:-local}/habit-tracker:1.0
+  environment:
+    DATABASE_URL: postgres://${POSTGRES_USER:-habit}:${POSTGRES_PASSWORD:-habit}@postgres:5432/${POSTGRES_DB:-habits}
+    REDIS_URL: redis://redis:6379
+    PORT: "8080"
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-habit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-habit}
+      POSTGRES_DB: ${POSTGRES_DB:-habits}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 so the check only passes once the real server is up,
+      # not the temporary init-time server that listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-habit} -d ${POSTGRES_DB:-habits}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.2-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Runs once and exits. Tracks applied files in schema_migrations, so
+  # re-running `docker compose up` never duplicates the seed data.
+  migrate:
+    <<: *app
+    command: ["node", "src/migrate.js"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    <<: *app
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
